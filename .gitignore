@@ -3,6 +3,7 @@
 cookies.txt
 system_settings.json
 user_settings.json
+global_settings.json
 
 # Data and History
 chat_history.json
@@ -26,17 +27,16 @@ debug_audio.pcm
 # Test results and temporary scripts
 test_results.txt
 test_results_final.txt
-test_isolation.py
-test_server_isolation.py
-test_maintenance_isolation.py
+test_*.py
+*_test.py
+repro_*.py
 focused_test.py
 rigorous_test.py
-test_media_reply.py
-test_mentions.py
-test_reply_logic.py
-test_shared_history.py
-test_tools.py
-test_results_final.txt
+inspect_roles.py
+list_models.py
+
+# Binaries and DLLs
+*.dll
 
 # OS Files
 .DS_Store
