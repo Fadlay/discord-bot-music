@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    build: .
+    container_name: meleyot-bot
+    restart: always
+    volumes:
+      # Persist data
+      - ./chat_history.json:/app/chat_history.json
+      - ./personas.json:/app/personas.json
+      # Mount whole directory for development (optional, remove in prod if desired)
+      # - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    # logging:
+    #   driver: "json-file"
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "3"

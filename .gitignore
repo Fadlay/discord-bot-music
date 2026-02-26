@@ -1,0 +1,45 @@
+# Secret keys and config
+.env
+cookies.txt
+system_settings.json
+user_settings.json
+
+# Data and History
+chat_history.json
+personas.json
+spotify_dump.json
+*.json.resolved*
+*.json.metadata.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env/
+
+# Media and Debug
+*.pcm
+*.log
+debug_audio.pcm
+
+# Test results and temporary scripts
+test_results.txt
+test_results_final.txt
+test_isolation.py
+test_server_isolation.py
+test_maintenance_isolation.py
+focused_test.py
+rigorous_test.py
+test_media_reply.py
+test_mentions.py
+test_reply_logic.py
+test_shared_history.py
+test_tools.py
+test_results_final.txt
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+temp_git/

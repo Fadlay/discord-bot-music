@@ -1,0 +1,14 @@
+discord.py>=2.3.2
+python-dotenv>=1.0.0
+PyNaCl>=1.5.0
+google-genai>=0.3.0
+yt-dlp>=2025.1.0
+yt-dlp-ejs
+ffmpeg-python
+beautifulsoup4
+requests
+spotipy
+numpy
+scipy
+psutil
+speedtest-cli
