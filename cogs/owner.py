@@ -193,7 +193,7 @@ class Owner(commands.Cog, name="Owner Commands"):
             await ctx.send("Global Persona was already set to **default**.")
 
     @commands.command(name='log', aliases=['logs', 'terminal'])
-    async def log_command(self, ctx, lines: int = 30):
+    async def log_command(self, ctx, lines: int = 20):
         """View recent terminal logs (Owner only)."""
         if not is_owner(ctx.author):
             return await ctx.send(embed=create_error_embed("Only owner can use this command."))

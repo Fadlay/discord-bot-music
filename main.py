@@ -11,7 +11,7 @@ from utils import is_owner, get_maintenance_state, create_error_embed, send_erro
 class DualStream:
     def __init__(self, original_stream, maxlen=100):
         self.original_stream = original_stream
-        self.buffer = collections.deque(maxlen=maxlen)
+        self.log_deque = collections.deque(maxlen=maxlen)
         self._current_chunk = ""
 
     def write(self, data):
@@ -21,7 +21,7 @@ class DualStream:
             lines = self._current_chunk.split('\n')
             # All elements except the last one are complete lines
             for line in lines[:-1]:
-                self.buffer.append(line)
+                self.log_deque.append(line)
             # The last element is the beginning of the next line
             self._current_chunk = lines[-1]
 
@@ -33,7 +33,7 @@ class DualStream:
         return getattr(self.original_stream, name)
 
     def get_logs(self, n=20):
-        logs = list(self.buffer)
+        logs = list(self.log_deque)
         if self._current_chunk:
             logs.append(self._current_chunk)
         return logs[-n:]
@@ -54,9 +54,17 @@ TOKEN = os.getenv('TOKEN')
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True # Required for voice interactions (Music + AI)
+intents.members = True # Required for member list and mentions
+intents.presences = True # Required to see who is online
 
 # Prefix: al! (Case insensitive)
-bot = commands.Bot(command_prefix=['al!', 'Al!', 'AL!'], intents=intents, case_insensitive=True, help_command=None)
+bot = commands.Bot(
+    command_prefix=['al!', 'Al!', 'AL!'], 
+    intents=intents, 
+    case_insensitive=True, 
+    help_command=None,
+    chunk_guilds_at_startup=True
+)
 
 # Attach log buffers
 bot.stdout_wrapper = stdout_wrapper

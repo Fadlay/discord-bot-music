@@ -3,6 +3,7 @@ import datetime
 import random
 import os
 import json
+import aiohttp
 from google import genai
 
 # Aesthetic Palette
@@ -228,3 +229,108 @@ async def send_error_log(bot, error, ctx=None, message=None, extra_info=None):
         await channel.send(embed=embed)
     except Exception as e:
         print(f"FAILED TO SEND ERROR LOG TO DISCORD: {e}")
+
+def clean_song_title(title: str) -> str:
+    import re
+    # Remove everything in [], (), 【】, 「」, 『』
+    title = re.sub(r'[\(\[\【\「\『].*?[\)\]\】\」\』]', '', title)
+    # Remove noise words
+    for noise in ['official', 'lyrics', 'video', 'ver', 'version', 'mv', 'hd', '4k', 'hq', 'audio', 'lyric']:
+        title = re.compile(r'\b' + re.escape(noise) + r'\b', re.IGNORECASE).sub('', title)
+    return title.strip()
+
+async def fetch_synced_lyrics(query: str):
+    """
+    Fetches synced lyrics from LRCLIB for a given query.
+    Returns a list of dictionaries: [{'time': float_seconds, 'text': str}, ...]
+    or None if no synced lyrics are found.
+    """
+    url = "https://lrclib.net/api/search"
+    
+    async def _search(q):
+        params = {'q': q}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list):
+                            # Filter for ones with syncedLyrics
+                            synced_tracks = [t for t in data if t.get('syncedLyrics')]
+                            if synced_tracks:
+                                best_match = synced_tracks[0]
+                                return parse_lrc(best_match['syncedLyrics'])
+        except Exception as e:
+            print(f"Error fetching lyrics for '{q}': {e}")
+        return None
+
+    # First try exact
+    result = await _search(query)
+    if result:
+        return result
+        
+    # If not found, try cleaned title
+    cleaned_query = clean_song_title(query)
+    if cleaned_query and cleaned_query != query:
+        return await _search(cleaned_query)
+        
+    return None
+
+def parse_lrc(lrc_text: str):
+    """Parses LRC format into a list of dictionaries."""
+    import re
+    lines = lrc_text.strip().split('\n')
+    parsed = []
+    # Match [mm:ss.xx] text
+    pattern = re.compile(r'\[(\d+):(\d+\.\d+)\](.*)')
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            minutes = int(match.group(1))
+            seconds = float(match.group(2))
+            text = match.group(3).strip()
+            total_seconds = minutes * 60 + seconds
+            parsed.append({'time': total_seconds, 'text': text})
+    return parsed
+
+async def fetch_youtube_captions(source_data: dict):
+    """
+    Extracts JSON3 captions from yt-dlp extracted data.
+    """
+    if not source_data:
+        return None
+        
+    subs_info = source_data.get('subtitles') or {}
+    auto_subs_info = source_data.get('automatic_captions') or {}
+    
+    # Try getting Indonesian first, then English, then any available
+    langs_to_try = ['id', 'en', 'en-US', 'en-GB']
+    all_langs = list(subs_info.keys()) + list(auto_subs_info.keys())
+    
+    for lang in langs_to_try + all_langs:
+        subs_list = subs_info.get(lang) or auto_subs_info.get(lang)
+        if subs_list:
+            json3_sub = next((s for s in subs_list if s.get('ext') == 'json3'), None)
+            if json3_sub and 'url' in json3_sub:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(json3_sub['url']) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                return parse_json3_captions(data)
+                except Exception as e:
+                    print(f"Error fetching yt captions: {e}")
+                    pass
+    return None
+
+def parse_json3_captions(data: dict):
+    parsed = []
+    events = data.get('events', [])
+    for e in events:
+        if 'segs' in e:
+            text = "".join(seg.get('utf8', '') for seg in e['segs']).strip()
+            if text and text != '\n':
+                time_seconds = e.get('tStartMs', 0) / 1000.0
+                parsed.append({'time': time_seconds, 'text': text})
+    return parsed if parsed else None
+

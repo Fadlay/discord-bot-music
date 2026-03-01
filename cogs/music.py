@@ -5,12 +5,13 @@ import requests
 import json
 import difflib
 import time
+import datetime
 import os
 import shutil
 from bs4 import BeautifulSoup
 from discord.ext import commands
 from async_timeout import timeout
-from utils import create_embed, create_error_embed, format_time, JOCKIE_COLOR, create_progress_bar, is_owner, send_error_log
+from utils import create_embed, create_error_embed, format_time, JOCKIE_COLOR, create_progress_bar, is_owner, send_error_log, fetch_synced_lyrics, fetch_youtube_captions
 
 # Suppress noise about console usage from errors
 yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ''
@@ -100,7 +101,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 class MusicPlayer:
     """A class which is assigned to each guild using the bot for Music."""
 
-    __slots__ = ('bot', '_guild', '_channel', '_cog', 'queue', 'next', 'current', 'np', 'volume', 'loop_mode', 'ffmpeg_opts', 'timer_enabled', 'autoplay', 'history', 'last_track', 'autoplay_candidate', 'start_time', 'sticky_task', 'prefetched_data', 'starter_id', 'stop_votes', 'last_voice_channel', 'reconnect_attempts', 'player_task', '_intentional_disconnect', 'last_error')
+    __slots__ = ('bot', '_guild', '_channel', '_cog', 'queue', 'next', 'current', 'np', 'volume', 'loop_mode', 'ffmpeg_opts', 'timer_enabled', 'autoplay', 'history', 'last_track', 'autoplay_candidate', 'start_time', 'sticky_task', 'prefetched_data', 'starter_id', 'stop_votes', 'last_voice_channel', 'reconnect_attempts', 'player_task', '_intentional_disconnect', '_force_reconnect', 'last_error', 'view', 'paused_at', 'total_paused_time', 'history_stack', 'lyrics', 'lyrics_mode', 'lyrics_source')
 
     def __init__(self, ctx, cog=None):
         self.bot = ctx.bot
@@ -130,7 +131,16 @@ class MusicPlayer:
         self.reconnect_attempts = 0
         self.player_task = None
         self._intentional_disconnect = False
+        self._force_reconnect = False
         self.last_error = None
+        self.view = None
+        self.paused_at = None
+        self.total_paused_time = 0
+        self.history_stack = []
+        self.history_stack = []
+        self.lyrics = None
+        self.lyrics_mode = False
+        self.lyrics_source = None
 
         self.player_task = ctx.bot.loop.create_task(self.player_loop())
 
@@ -140,14 +150,16 @@ class MusicPlayer:
             print(f"DEBUG: Skipping reconnect for guild {self._guild.id} (intentional disconnect)")
             return False
 
-        if self.reconnect_attempts >= 3:
-            print(f"DEBUG: Reconnect failed after 3 attempts for guild {self._guild.id}")
+        if self.reconnect_attempts >= 5:
+            print(f"DEBUG: Reconnect failed after 5 attempts for guild {self._guild.id}")
             if self._channel:
                  await self._channel.send(embed=create_error_embed("Failed to reconnect to voice channel after multiple attempts. Stopping playback."))
-            return self.destroy(self._guild)
+            return False  # Let caller handle cleanup
 
         self.reconnect_attempts += 1
-        print(f"DEBUG: Reconnection attempt {self.reconnect_attempts} for guild {self._guild.id}")
+        wait_time = min(5 * self.reconnect_attempts, 30)  # 5s, 10s, 15s, 20s, 25s
+        print(f"DEBUG: Reconnection attempt {self.reconnect_attempts}/5 for guild {self._guild.id} (waiting {wait_time}s)")
+        await asyncio.sleep(wait_time)
 
         try:
             if self.last_voice_channel:
@@ -166,7 +178,6 @@ class MusicPlayer:
                 return False
         except Exception as e:
             print(f"DEBUG: Reconnect error: {e}")
-            await asyncio.sleep(5) # Wait before next attempt
             return await self.reconnect()
 
     async def prepare_next_song(self, current_track=None):
@@ -235,29 +246,69 @@ class MusicPlayer:
 
     async def update_sticky_message(self):
         """Loop to update the Now Playing message (Progress only, no longer sticky to avoid rate limits)."""
-        while self.current and self._guild.voice_client and self._guild.voice_client.is_playing():
+        while self.current and self._guild.voice_client:
             try:
                 # Calculate Progress
-                elapsed = time.time() - self.start_time
+                if self.paused_at:
+                    elapsed = self.paused_at - self.start_time - self.total_paused_time
+                else:
+                    elapsed = time.time() - self.start_time - self.total_paused_time
+                
                 duration = self.current.duration
                 
                 # Build Embed
                 display_url = self.current.webpage_url if hasattr(self.current, 'webpage_url') and self.current.webpage_url else self.current.url
-                embed = create_embed("🎶 Now Playing", f"[{self.current.title}]({display_url})")
-                embed.set_image(url=self.current.thumbnail)
                 
-                if duration:
-                    prog_bar = create_progress_bar(elapsed, duration)
-                    embed.add_field(name="Progress", value=f"`{format_time(elapsed)}` {prog_bar} `{format_time(duration)}`", inline=False)
+                if self.lyrics_mode and self.lyrics:
+                    # Find current lyric line
+                    current_line_idx = -1
+                    for ii, l in enumerate(self.lyrics):
+                        if l['time'] <= elapsed:
+                            current_line_idx = ii
+                        else:
+                            break
+                            
+                    lyrics_display = ""
+                    if current_line_idx == -1:
+                        lyrics_display = "*Waiting for lyrics to start...*"
+                    else:
+                        start_idx = max(0, current_line_idx - 1)
+                        end_idx = min(len(self.lyrics), current_line_idx + 3)
+                        
+                        for i in range(start_idx, end_idx):
+                            line_text = self.lyrics[i]['text'] or "🎵"
+                            if i == current_line_idx:
+                                lyrics_display += f"## {line_text}\n"
+                            else:
+                                lyrics_display += f"*{line_text}*\n"
+                                
+                    embed = create_embed(f"🎤 Lyrics: {self.current.title}", lyrics_display)
+                    
+                    footer_text = f"Playing in {self._guild.name} • Time: {format_time(elapsed)}"
+                    if getattr(self, 'lyrics_source', None):
+                        footer_text += f"\nSource: {self.lyrics_source}"
+                        
+                    embed.set_footer(text=footer_text, icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
+                else:
+                    embed = create_embed("🎶 Now Playing", f"[{self.current.title}]({display_url})")
+                    embed.set_image(url=self.current.thumbnail)
+                    
+                    if duration:
+                        prog_bar = create_progress_bar(elapsed, duration)
+                        embed.add_field(name="Progress", value=f"`{format_time(elapsed)}` {prog_bar} `{format_time(duration)}`", inline=False)
+                    
+                    embed.add_field(name="Looping", value=["❌ Off", "🔂 Track", "🔁 Queue"][self.loop_mode], inline=True)
+                    embed.add_field(name="Volume", value=f"🔊 {int(self.volume * 100)}%", inline=True)
+                    embed.set_footer(text=f"Playing in {self._guild.name}", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
                 
-                embed.add_field(name="Looping", value=["❌ Off", "🔂 Track", "🔁 Queue"][self.loop_mode], inline=True)
-                embed.add_field(name="Volume", value=f"🔊 {int(self.volume * 100)}%", inline=True)
-                embed.set_footer(text=f"Playing in {self._guild.name}", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
-                
+                # Update View state if exists
+                if self.view:
+                    self.view.update_buttons()
+
                 # Update existing message
                 if self.np:
                     try:
-                        await self.np.edit(embed=embed)
+                        await self.np.edit(embed=embed, view=self.view)
                     except discord.NotFound:
                         # Message was deleted by a user, stop trying to update it
                         self.np = None
@@ -267,7 +318,7 @@ class MusicPlayer:
             except Exception as e:
                 print(f"NP loop update error: {e}")
                 
-            await asyncio.sleep(5) # Update every 5 seconds
+            await asyncio.sleep(2.5 if self.lyrics_mode and self.lyrics else 5) # Update faster if lyrics are showing
 
     async def player_loop(self):
         """Our main player loop."""
@@ -282,9 +333,9 @@ class MusicPlayer:
             self.next.clear()
 
             try:
-                if self.loop_mode == 1 and self.current:
-                    # Loop Track: Replay current
-                    data = self.current.data
+                if self.loop_mode == 1 and self.last_track:
+                    # Loop Track: Replay current (which is now last_track)
+                    data = self.last_track.data
                     source = await YTDLSource.from_url(data['webpage_url'], loop=self.bot.loop, stream=True, ffmpeg_opts=self.ffmpeg_opts)
                 else:
                     # Inactivity Timer logic: Disable if Live Mode is active in this guild
@@ -296,8 +347,8 @@ class MusicPlayer:
                     
                     try:
                         async with timeout(timeout_duration):
-                            # Autoplay Logic
-                            if self.queue.empty() and self.autoplay:
+                            # Autoplay Logic: Only if no loop is active
+                            if self.queue.empty() and self.autoplay and self.loop_mode == 0:
                                 recommendation = None
                                 
                                 # Check if we have a pre-fetched candidate
@@ -318,7 +369,8 @@ class MusicPlayer:
                             # Only warn if we've actually played something (history not empty) to avoid startup warning
                             # AND if there are users in the channel (if alone, let the auto-leave handler warn)
                             channel_members = self._guild.voice_client.channel.members if self._guild.voice_client else []
-                            if self.queue.empty() and self.timer_enabled and self.history and len(channel_members) > 1:
+                            voice_is_active = self._guild.voice_client and (self._guild.voice_client.is_playing() or self._guild.voice_client.is_paused())
+                            if self.queue.empty() and self.timer_enabled and self.history and len(channel_members) > 1 and not voice_is_active:
                                 try:
                                     if self._channel:
                                         await self._channel.send(embed=create_embed("Info", "No more tracks in queue. Disconnecting in 3 minutes if no song is added."))
@@ -328,14 +380,14 @@ class MusicPlayer:
                             item = await self.queue.get()
                     except asyncio.TimeoutError:
                         if self.timer_enabled and self.queue.empty(): # double check empty
+                            # Don't timeout if voice client is still playing (e.g. after reconnect resume)
+                            if self._guild.voice_client and (self._guild.voice_client.is_playing() or self._guild.voice_client.is_paused()):
+                                continue
+
                             # If we are alone, let on_voice_state_update handle the disconnect to avoid double messages
                             channel_members = self._guild.voice_client.channel.members if self._guild.voice_client else []
                             if len(channel_members) <= 1:
-                                # We are alone (or disconnected), just return/wait? 
-                                # If we return, we stop the player loop. The auto-leave listener should handle the rest.
-                                # But strictly, if we stop the loop, we are technically "idle".
-                                # Let's just return.
-                                return self.destroy(self._guild) # Actually destroy is fine, but maybe suppress message?
+                                return self.destroy(self._guild)
                             
                             try:
                                 if self._channel:
@@ -413,7 +465,17 @@ class MusicPlayer:
                                  print(f"Skipping item with no URL: {data}")
                                  continue
                                  
-                             source = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True, ffmpeg_opts=self.ffmpeg_opts)
+                             # Check for resume seek (from reconnect)
+                             resume_seek = data.get('_resume_seek', 0)
+                             effective_ffmpeg_opts = dict(self.ffmpeg_opts) if self.ffmpeg_opts else {}
+                             if resume_seek > 0:
+                                 base_before = ffmpeg_options.get('before_options', '')
+                                 effective_ffmpeg_opts['before_options'] = f"-ss {resume_seek} {base_before}"
+                             
+                             source = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True, ffmpeg_opts=effective_ffmpeg_opts)
+                             
+                             # Store seek on source for start_time adjustment
+                             source._resume_seek = resume_seek
                         else:
                              # It's already a full data object
                              url = item.url if hasattr(item, 'url') else None
@@ -432,9 +494,37 @@ class MusicPlayer:
 
             source.volume = self.volume
             self.current = source
+            self.lyrics = None
+            self.lyrics_source = None
             
-            # Record Start Time
-            self.start_time = time.time()
+            # Fetch lyrics in background
+            if source.title:
+                async def _fetch_lyrics():
+                    try:
+                        self.lyrics = await fetch_synced_lyrics(source.title)
+                        if self.lyrics:
+                            self.lyrics_source = "LRCLIB Database"
+                        elif not self.lyrics and source.data:
+                            self.lyrics = await fetch_youtube_captions(source.data)
+                            if self.lyrics:
+                                self.lyrics_source = "YouTube Closed Captions"
+                    except Exception as e:
+                        print(f"Failed to fetch lyrics/captions for {source.title}: {e}")
+                self.bot.loop.create_task(_fetch_lyrics())
+            
+            # Record Start Time (adjust for resume seek if applicable)
+            resume_seek = getattr(source, '_resume_seek', 0)
+            self.start_time = time.time() - resume_seek
+            self.paused_at = None
+            self.total_paused_time = 0
+            
+            # Add to History Stack for "Previous" functionality
+            if source.data:
+                # Avoid adding if we are just looping the same track
+                if not self.history_stack or self.history_stack[-1].get('id') != source.data.get('id'):
+                    self.history_stack.append(source.data)
+                    if len(self.history_stack) > 20:
+                        self.history_stack.pop(0)
 
             # Add to history
             track_id = getattr(source, 'data', {}).get('id')
@@ -510,7 +600,10 @@ class MusicPlayer:
             embed.add_field(name="Volume", value=f"🔊 {int(self.volume * 100)}%", inline=True)
             embed.set_footer(text=f"Playing in {self._guild.name}", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
             
-            self.np = await self._channel.send(embed=embed)
+            # Create View
+            self.view = PlayerControlView(self)
+            
+            self.np = await self._channel.send(embed=embed, view=self.view)
             
             # START STICKY TASK
             self.sticky_task = self.bot.loop.create_task(self.update_sticky_message())
@@ -574,11 +667,15 @@ class MusicPlayer:
             
             try:
                 if self.np:
+                    print(f"DEBUG: Deleting NP message for guild {self._guild.id}")
                     await self.np.delete()
-            except:
-                pass
+            except Exception as e:
+                print(f"DEBUG: Failed to delete NP: {e}")
             finally:
                 self.np = None
+                if self.view:
+                    self.view.stop()
+                    self.view = None
 
     def is_similar(self, title1, title2):
         """Check if two titles are too similar (clean version, years, etc)."""
@@ -617,7 +714,6 @@ class MusicPlayer:
         loop = self.bot.loop or asyncio.get_event_loop()
         
         # Options for fast scraping
-        # Options for fast scraping
         opts = dict(ytdl_format_options) # Copy global sub-options if needed, or just new dict
         opts.update({
             'extract_flat': True,
@@ -641,10 +737,6 @@ class MusicPlayer:
                 entries = list(info['entries'])
                 
                 for entry in entries:
-                    # entries is a generator/islice in flat extraction if process=False?
-                    # wait, if process=False, keys are generators? 
-                    # extract_flat=True usually returns dict with 'entries' as list or generator.
-                    # let's play safe and check.
                     if not entry: continue
                     
                     title = entry.get('title')
@@ -656,11 +748,9 @@ class MusicPlayer:
                     if vid == video_id: continue
                     
                     # 2. Skip if ID exists in History (Exact match)
-                    # This fulfills the user's request: "tidak memutar lagu dari link yang sama"
                     if any(h.get('id') == vid for h in self.history): continue
                     
                     # 3. Skip ONLY if the title is an EXACT match (Case insensitive)
-                    # This prevents the exact same song if re-uploaded, but allows Remix/2024 Ver.
                     if any(h['title'].lower() == title.lower() for h in self.history): continue
                     
                     return entry
@@ -677,6 +767,154 @@ class MusicPlayer:
     def destroy(self, guild):
         """Disconnect and cleanup the player."""
         return self.bot.loop.create_task(self._cog.cleanup(guild))
+
+class PlayerControlView(discord.ui.View):
+    def __init__(self, player):
+        super().__init__(timeout=None)
+        self.player = player
+        self.update_buttons()
+
+    def update_buttons(self):
+        # Pause/Resume Button
+        is_playing = self.player._guild.voice_client and not self.player._guild.voice_client.is_paused()
+        self.toggle_play.label = "Pause" if is_playing else "Resume"
+        self.toggle_play.emoji = "⏸️" if is_playing else "▶️"
+        self.toggle_play.style = discord.ButtonStyle.secondary if is_playing else discord.ButtonStyle.success
+
+        # Loop Button
+        loop_emojis = ["❌", "🔂", "🔁"]
+        self.cycle_loop.emoji = loop_emojis[self.player.loop_mode]
+        self.cycle_loop.label = ["No Loop", "Loop Track", "Loop Queue"][self.player.loop_mode]
+
+        # Autoplay Button
+        if self.player.autoplay:
+            self.toggle_autoplay.label = "Autoplay ON"
+            self.toggle_autoplay.style = discord.ButtonStyle.success
+            self.toggle_autoplay.emoji = "🤖"
+        else:
+            self.toggle_autoplay.label = "Autoplay OFF"
+            self.toggle_autoplay.style = discord.ButtonStyle.secondary
+            self.toggle_autoplay.emoji = "🤖"
+            
+        # Lyrics Button Style
+        if hasattr(self, 'toggle_lyrics'):
+            if self.player.lyrics_mode:
+                self.toggle_lyrics.style = discord.ButtonStyle.success
+            else:
+                self.toggle_lyrics.style = discord.ButtonStyle.secondary
+
+    @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
+    async def shuffle_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.player.queue.empty():
+            return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        
+        items = []
+        while not self.player.queue.empty():
+            items.append(self.player.queue.get_nowait())
+        
+        import random
+        random.shuffle(items)
+        
+        for item in items:
+            await self.player.queue.put(item)
+            
+        await interaction.response.send_message("Queue shuffled.", ephemeral=True, delete_after=5)
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.primary, emoji="⏮️", row=0)
+    async def prev_track_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_prev(interaction)
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0)
+    async def toggle_play(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player._guild.voice_client:
+            return await interaction.response.send_message("Not connected to voice.", ephemeral=True)
+        
+        if self.player._guild.voice_client.is_paused():
+            # RESUME
+            if self.player.paused_at:
+                self.player.total_paused_time += time.time() - self.player.paused_at
+                self.player.paused_at = None
+                
+            self.player._guild.voice_client.resume()
+            await interaction.response.send_message("Resumed playback.", ephemeral=True, delete_after=5)
+        else:
+            # PAUSE
+            self.player.paused_at = time.time()
+            self.player._guild.voice_client.pause()
+            await interaction.response.send_message("Paused playback.", ephemeral=True, delete_after=5)
+        
+        self.update_buttons()
+        # Initial feedback update
+        await interaction.message.edit(view=self)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, emoji="⏭️", row=0)
+    async def skip_track(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.player._guild.voice_client:
+            self.player._guild.voice_client.stop()
+            await interaction.response.send_message("Skipped track.", ephemeral=True, delete_after=5)
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+
+    @discord.ui.button(label="Loop", style=discord.ButtonStyle.secondary, emoji="❌", row=0)
+    async def cycle_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.loop_mode = (self.player.loop_mode + 1) % 3
+        self.update_buttons()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=1)
+    async def stop_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Stopping player...", ephemeral=True, delete_after=5)
+        self.player.destroy(self.player._guild)
+
+    @discord.ui.button(label="Autoplay OFF", style=discord.ButtonStyle.secondary, emoji="🤖", row=1)
+    async def toggle_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.autoplay = not self.player.autoplay
+        status = "enabled" if self.player.autoplay else "disabled"
+        self.update_buttons()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Lyrics", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
+    async def toggle_lyrics(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.player.lyrics:
+            return await interaction.response.send_message("No synced lyrics or captions found for this track.", ephemeral=True)
+            
+        self.player.lyrics_mode = not self.player.lyrics_mode
+        self.update_buttons()
+        # The background loop will update the message within a few seconds, but edit UI immediately
+        await interaction.response.edit_message(view=self)
+
+    async def handle_prev(self, interaction_or_ctx):
+        # We need at least 2 items in history_stack to go back (index -1 is current, index -2 is previous)
+        if len(self.player.history_stack) < 2:
+            msg = "No previous track in history."
+            if isinstance(interaction_or_ctx, discord.Interaction):
+                return await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+            return await interaction_or_ctx.send(embed=create_error_embed(msg))
+
+        # Pop current track (it will be re-added when it starts playing again if we don't handle it, 
+        # but player_loop adds on START, so we pop current and previous, then push previous to queue)
+        self.player.history_stack.pop() # Remove current
+        prev_data = self.player.history_stack.pop() # Get actual previous
+        
+        # Put at front of queue
+        queue_list = []
+        while not self.player.queue.empty():
+            queue_list.append(self.player.queue.get_nowait())
+        
+        # Re-add previous followed by old queue
+        await self.player.queue.put(prev_data)
+        for item in queue_list:
+            await self.player.queue.put(item)
+            
+        if self.player._guild.voice_client:
+            self.player._guild.voice_client.stop()
+            
+        msg = f"Replaying previous track: **{prev_data.get('title')}**"
+        if isinstance(interaction_or_ctx, discord.Interaction):
+            await interaction_or_ctx.response.send_message(msg, ephemeral=True, delete_after=5)
+        else:
+            await interaction_or_ctx.send(embed=create_embed("⏮️ Previous", msg))
+
 
 class PaginationView(discord.ui.View):
     def __init__(self, ctx, data_list, title="List"):
@@ -731,6 +969,7 @@ class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.players = {}
+        self._last_gateway_resume = 0  # Timestamp of last gateway reconnect
         self._cookie_refresh_task = bot.loop.create_task(self._cookie_refresh_loop())
 
     async def _cookie_refresh_loop(self):
@@ -847,8 +1086,14 @@ class Music(commands.Cog):
         return player
 
     @commands.Cog.listener()
+    async def on_resumed(self):
+        """Track when the gateway reconnects after a disconnect."""
+        self._last_gateway_resume = time.time()
+        print(f"DEBUG: Gateway resumed at {self._last_gateway_resume}")
+
+    @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        """Handle voice channel updates for auto-leave and kick detection."""
+        """Handle voice channel updates for auto-leave, kick detection, and auto-reconnect."""
         # Track bot's own voice state to remember last channel OR detect kicks
         if member == self.bot.user:
             player = self.players.get(member.guild.id)
@@ -859,8 +1104,67 @@ class Music(commands.Cog):
                 elif before.channel and not after.channel:
                     # Bot was disconnected from a channel
                     if not player._intentional_disconnect:
-                        print(f"DEBUG: Bot was externally disconnected/kicked from {before.channel.name}. Cleaning up.")
-                        await self.cleanup(member.guild)
+                        # Detect kick vs network drop using gateway resume timing
+                        # When internet drops: gateway reconnects -> on_resumed fires -> then voice_state_update
+                        # When kicked by moderator: gateway was fine, no on_resumed event
+                        time_since_resume = time.time() - self._last_gateway_resume
+                        is_network_drop = time_since_resume < 30 or getattr(player, '_force_reconnect', False)
+                        
+                        print(f"DEBUG: Voice disconnect detected. time_since_resume={time_since_resume:.1f}s, is_network_drop={is_network_drop}")
+                        
+                        # Clear the force_reconnect flag if it was set (by al!simdrop)
+                        if hasattr(player, '_force_reconnect'):
+                            player._force_reconnect = False
+                        
+                        if not is_network_drop:
+                            # Moderator kicked the bot - clean up, do NOT reconnect
+                            print(f"DEBUG: Bot was kicked from {before.channel.name}. Cleaning up.")
+                            await self.cleanup(member.guild)
+                        else:
+                            # Network drop - attempt reconnect
+                            print(f"DEBUG: Bot lost voice connection from {before.channel.name}. Attempting reconnect...")
+                            player.last_voice_channel = before.channel
+                            player.reconnect_attempts = 0
+                            
+                            # Save track info and elapsed time IMMEDIATELY
+                            # player.current is likely already None (cleaned up by player_loop),
+                            # so use last_track as fallback
+                            track_to_resume = player.current or player.last_track
+                            resume_data = dict(track_to_resume.data) if track_to_resume else None
+                            
+                            # Calculate elapsed playback time for seeking
+                            elapsed_seconds = 0
+                            if player.start_time:
+                                if player.paused_at:
+                                    elapsed_seconds = player.paused_at - player.start_time - player.total_paused_time
+                                else:
+                                    elapsed_seconds = time.time() - player.start_time - player.total_paused_time
+                            elapsed_seconds = max(0, int(elapsed_seconds))
+                            
+                            print(f"DEBUG: Track to resume: {resume_data.get('title') if resume_data else 'None'}, elapsed: {elapsed_seconds}s")
+                            
+                            success = await player.reconnect()
+                            if not success:
+                                print(f"DEBUG: All reconnect attempts failed for guild {member.guild.id}. Cleaning up.")
+                                await self.cleanup(member.guild)
+                            else:
+                                # Successfully reconnected! Put track back in queue with seek info
+                                # The player_loop will handle playback, NP message, and cleanup naturally
+                                if resume_data:
+                                    resume_data['_resume_seek'] = elapsed_seconds
+                                    # Use put_nowait instead of _queue.appendleft
+                                    # appendleft bypasses asyncio.Queue notification,
+                                    # so queue.get() waiters never wake up!
+                                    player.queue.put_nowait(resume_data)
+                                    elapsed_fmt = f"{elapsed_seconds // 60}:{elapsed_seconds % 60:02d}"
+                                    print(f"DEBUG: Queued resume track at {elapsed_fmt} for guild {member.guild.id}")
+                                    if player._channel:
+                                        await player._channel.send(
+                                            embed=create_embed("🔄 Reconnected", f"Resuming playback at `{elapsed_fmt}`..."),
+                                            delete_after=10
+                                        )
+                                else:
+                                    print(f"DEBUG: Reconnected but no track to resume.")
             return
 
         if member.bot: return
@@ -1042,17 +1346,35 @@ class Music(commands.Cog):
     async def pause(self, ctx):
         """Pause the currently playing song."""
         if ctx.voice_client and ctx.voice_client.is_playing():
+            player = self.get_player(ctx)
+            player.paused_at = time.time()
             ctx.voice_client.pause()
             await ctx.send(embed=create_embed("Paused", "Music paused."))
+        else:
+            await ctx.send(embed=create_error_embed("Music is not playing."))
 
     @commands.command(name='resume')
     async def resume(self, ctx):
         """Resume the currently paused song."""
         if ctx.voice_client and ctx.voice_client.is_paused():
+            player = self.get_player(ctx)
+            if player.paused_at:
+                player.total_paused_time += time.time() - player.paused_at
+                player.paused_at = None
             ctx.voice_client.resume()
             await ctx.send(embed=create_embed("Resumed", "Music resumed."))
+        else:
+            await ctx.send(embed=create_error_embed("Music is not paused."))
 
-    @commands.command(name='stop')
+    @commands.command(name='prev', aliases=['previous'])
+    async def prev(self, ctx):
+        """Play the previous song in history."""
+        player = self.get_player(ctx)
+        if not player.view:
+            player.view = PlayerControlView(player)
+        await player.view.handle_prev(ctx)
+
+    @commands.command(name='stop', aliases=['leave'])
     async def stop(self, ctx):
         """Stops playing and clears the queue (Requires voting or Starter)."""
         if ctx.guild.id not in self.players:
@@ -1220,6 +1542,122 @@ class Music(commands.Cog):
             
         title = removed_item.get('title') if isinstance(removed_item, dict) else removed_item.title
         await ctx.send(embed=create_embed("🗑️ Removed", f"Removed **{title}** from the queue."))
+
+    @commands.command(name='playlist', aliases=['pl'])
+    async def playlist(self, ctx, vibe: str = None, count: int = 5):
+        """Generate an AI playlist based on a vibe/genre."""
+        if not vibe:
+            return await ctx.send(embed=create_error_embed(
+                "Kasih vibe/genre dong!\n"
+                "Contoh: `al!playlist lofi 10`, `al!playlist rock`, `al!playlist galau 15`"
+            ))
+
+        count = max(1, min(25, count))
+
+        async with ctx.typing():
+            if not ctx.voice_client:
+                await ctx.invoke(self.join)
+            if not ctx.voice_client:
+                return
+
+            # MUTUAL EXCLUSION: Check if MeLagu Live is active
+            live_cog = self.bot.get_cog("MeLaguLive")
+            if live_cog and live_cog.live_session:
+                return await ctx.send(embed=create_error_embed(
+                    "Cannot generate playlist while MeLagu Live is active. Stop Live first with `al!stoplive`!"
+                ))
+
+            player = self.get_player(ctx)
+
+            # Reuse the Chat cog's key manager (already initialized & rotated)
+            chat_cog = self.bot.get_cog("Chat")
+            if not chat_cog or not chat_cog.key_manager.has_keys:
+                return await ctx.send(embed=create_error_embed("Gemini API Key tidak ditemukan!"))
+            key_manager = chat_cog.key_manager
+
+            prompt = (
+                f"Generate exactly {count} song recommendations for the vibe/genre: \"{vibe}\".\n"
+                f"Return ONLY a valid JSON array of strings, where each string is in the format \"Artist - Song Title\".\n"
+                f"Example: [\"Nujabes - Feather\", \"J Dilla - So Far to Go\"]\n"
+                f"Pick real, well-known songs that match the vibe. Mix popular and hidden gems.\n"
+                f"Do NOT include any explanation, markdown, or code blocks. ONLY the JSON array."
+            )
+
+            try:
+                from google.genai import types as genai_types
+                from google.genai import errors as genai_errors
+
+                key_manager.reset_failure_checks()
+                response = None
+
+                while True:
+                    client = key_manager.get_client()
+                    try:
+                        response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                            contents=[genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=prompt)])],
+                            config=genai_types.GenerateContentConfig(temperature=1.0)
+                        )
+                        break  # Success
+                    except genai_errors.APIError as e:
+                        if e.code == 429:
+                            print(f"Playlist: Key {key_manager.current_index} rate limited. Rotating...")
+                            if key_manager.rotate():
+                                continue
+                            else:
+                                return await ctx.send(embed=create_error_embed(
+                                    "Semua API Key sudah kena rate limit. Coba lagi nanti ya! 🙏"
+                                ))
+                        else:
+                            raise e
+
+                raw_text = response.text.strip()
+                # Clean up potential markdown wrapping
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.split("\n", 1)[-1]
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3].strip()
+
+                songs = json.loads(raw_text)
+
+                if not isinstance(songs, list) or len(songs) == 0:
+                    return await ctx.send(embed=create_error_embed("AI tidak bisa generate playlist. Coba lagi!"))
+
+            except Exception as e:
+                print(f"Playlist AI error: {e}")
+                return await ctx.send(embed=create_error_embed(f"Gagal generate playlist: {e}"))
+
+            # Queue all songs (same format as Spotify bridge)
+            song_list_text = ""
+            for i, song in enumerate(songs):
+                await player.queue.put({'query': song, 'title': song, 'webpage_url': None, 'requester': ctx.author})
+                song_list_text += f"**{i+1}.** {song}\n"
+
+            embed = create_embed(
+                f"🤖 AI Playlist: {vibe.title()}",
+                f"Berhasil menambahkan **{len(songs)}** lagu ke queue!\n\n{song_list_text}"
+            )
+            embed.set_footer(
+                text=f"Requested by {ctx.author}",
+                icon_url=ctx.author.avatar.url if ctx.author.avatar else None
+            )
+            await ctx.send(embed=embed)
+
+    @commands.command(name='simdrop')
+    async def simulate_drop(self, ctx):
+        """Simulate a network drop to test auto-reconnect."""
+        player = self.players.get(ctx.guild.id)
+        if not player or not ctx.guild.voice_client:
+            return await ctx.send(embed=create_error_embed("Bot is not connected to a voice channel."))
+
+        await ctx.send(embed=create_embed("⚡ Simulating Drop", "Forcing voice disconnect to test reconnect..."))
+        # Set flag so the handler knows to treat this as a network drop
+        player._force_reconnect = True
+        # Force disconnect WITHOUT setting _intentional_disconnect
+        try:
+            await ctx.guild.voice_client.disconnect(force=True)
+        except:
+            pass
 
 async def setup(bot):
     await bot.add_cog(Music(bot))

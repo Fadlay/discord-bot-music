@@ -156,6 +156,55 @@ class Chat(commands.Cog):
         
         instruction = persona_data["instruction"]
 
+        # --- EMOJI & STICKER AWARENESS ---
+        instruction += "\n\n[EMOJI & STICKER GUIDELINES]:\n"
+        instruction += "- Kamu bisa melihat emoji kustom user dalam format :nama_emoji: dan stiker dalam format [Sticker: nama_stiker].\n"
+        instruction += "- Kamu memiliki kemampuan 'Nitro'. Kamu bisa menggunakan emoji kustom dari seluruh server yang bot masuki dengan menulis :nama_emoji:. Bot akan otomatis mengubahnya menjadi emoji asli.\n"
+        instruction += "- PENTING: Jangan mengarang nama emoji kustom yang tidak ada (misal :shocked:). Gunakan HANYA nama emoji yang ada di daftar [AVAILABLE EMOJIS] di bawah ini, atau emoji standar bawaan.\n"
+        instruction += "- Untuk stiker, kamu hanya bisa mengirim stiker yang berasal dari server ini. Jika kamu mencoba mengirim stiker luar, bot mungkin hanya mengirimkan teksnya saja.\n"
+        instruction += "- Kamu bisa memanggil (mention) orang dengan format @username (gunakan username unik yang ada di tanda kurung dari [SERVER MEMBERS]). Contoh: jika ada member 'Aiden (@aidennn)', panggil dengan @aidennn. Bot akan otomatis mengubahnya menjadi mention biru."
+
+        # --- AVAILABLE EMOJIS CONTEXT ---
+        try:
+            if self.bot.emojis:
+                import random
+                # Provide up to 150 global emojis to give the AI a good vocabulary without bloating the prompt
+                sample_emojis = self.bot.emojis
+                if len(sample_emojis) > 150:
+                    sample_emojis = random.sample(sample_emojis, 150)
+                
+                emoji_names = sorted([f":{e.name}:" for e in sample_emojis])
+                instruction += f"\n\n[AVAILABLE EMOJIS (Showing {len(emoji_names)}/{len(self.bot.emojis)})]:\n"
+                instruction += ", ".join(emoji_names)
+        except Exception as e:
+            print(f"DEBUG: Failed to fetch emoji list: {e}")
+
+        # --- SERVER MEMBER CONTEXT ---
+        if guild:
+            try:
+                # Prioritize online/active members
+                all_members = list(guild.members)
+                # Filter out bots and sort: Online -> Idle -> DND -> Offline
+                all_members.sort(key=lambda m: (m.status == discord.Status.offline, m.status == discord.Status.invisible, m.bot))
+                
+                member_list = []
+                for m in all_members:
+                    if m.bot: continue
+                    if len(member_list) >= 100: break # Keep prompt size safe
+                    
+                    status_icon = "🟢" if m.status == discord.Status.online else "🟡" if m.status == discord.Status.idle else "🔴" if m.status == discord.Status.dnd else "⚪"
+                    roles = [r.name for r in m.roles if r.name != "@everyone"][:3] # Max 3 roles for brevity
+                    role_str = f" ({', '.join(roles)})" if roles else ""
+                    member_list.append(f"- {status_icon} {m.display_name} (@{m.name}){role_str}")
+                
+                total_members = guild.member_count
+                if member_list:
+                    instruction += f"\n\n[SERVER MEMBERS (Showing 100/{total_members})]:\n" + "\n".join(member_list)
+                    if total_members > 100:
+                        instruction += "\n... (Daftar di atas diprioritaskan untuk member yang sedang online)"
+            except Exception as e:
+                print(f"DEBUG: Failed to fetch member list: {e}")
+
         # Inject Song Context if available
         if guild:
             music_cog = self.bot.get_cog("Music")
@@ -315,24 +364,33 @@ class Chat(commands.Cog):
                     async with self.locks[history_id]:
                         print(f"DEBUG: Processing message from {message.author}: {message.content} (History: {history_id})")
                         
-                        # Clean content
-                        # Use clean_content to resolve <@ID> to @Name
+                        # --- MESSAGE PRE-PROCESSING ---
                         clean_text = message.clean_content
-                        # Remove the bot's own mention from the prompt to avoid it being treated as part of the query
-                        # We check for both the nickname and the global username
+                        # Remove the bot's own mention
                         bot_mention_nick = f"@{message.guild.me.display_name}" if message.guild else f"@{self.bot.user.name}"
                         bot_mention_user = f"@{self.bot.user.name}"
                         
                         raw_user_input = clean_text.replace(bot_mention_nick, "").replace(bot_mention_user, "").strip()
-                        if not raw_user_input: raw_user_input = "Hello"
+                        
+                        # 1. Process Stickers
+                        if message.stickers:
+                            sticker_info = " ".join([f"[Sticker: {s.name}]" for s in message.stickers])
+                            raw_user_input = (raw_user_input + f"\n{sticker_info}").strip()
+
+                        # 2. Simplify Custom Emojis for AI (from <:name:id> to :name:)
+                        import re
+                        raw_user_input = re.sub(r'<(a?):(\w+):(\d+)>', r':\2:', raw_user_input)
+
+                        # Final Fallback
+                        if not raw_user_input: 
+                            raw_user_input = "Hello"
                         
                         prompt_text = raw_user_input
                         
-                        # Check for Reply Context
+                        # 3. Check for Reply Context (Add prefix to prompt_text)
                         replied_msg = None
                         if message.reference and message.reference.message_id:
                             try:
-                                # Use cached message if possible, otherwise fetch
                                 replied_msg = message.reference.cached_message
                                 if not replied_msg:
                                     replied_msg = await message.channel.fetch_message(message.reference.message_id)
@@ -340,7 +398,6 @@ class Chat(commands.Cog):
                                 author_name = replied_msg.author.display_name
                                 replied_content = replied_msg.clean_content
                                 
-                                # Limit context length to avoid huge prompts
                                 if len(replied_content) > 500:
                                     replied_content = replied_content[:497] + "..."
                                     
@@ -349,6 +406,7 @@ class Chat(commands.Cog):
                                 print(f"DEBUG: Added reply context from {author_name}")
                             except Exception as e:
                                 print(f"DEBUG: Failed to fetch reply context: {e}")
+                        # --- END PRE-PROCESSING ---
 
                         # CHECK FOR LIVE SESSION (Text-to-Speech Mode)
                         live_cog = self.bot.get_cog("MeLaguLive")
@@ -416,14 +474,15 @@ class Chat(commands.Cog):
                     # 4. Generate Content with History
                     # === INTENT DETECTION ===
                     # We check only the actual message content (without prefix/context) for music keywords
-                    music_keywords = ["putar", "play", "skip", "volume", "lagu", "musik", "pause", "resume", "berhenti", "stop", "antrean", "queue", "shuffle", "loop", "bassboost", "nightcore", "vaporwave", "speed", "reset"]
+                    music_keywords = ["putar", "play", "skip", "volume", "lagu", "musik", "pause", "resume", "berhenti", "stop", "antrean", "queue", "shuffle", "loop", "bassboost", "nightcore", "vaporwave", "speed", "reset", "playlist", "rekomendasi", "rekomen", "recommend", "vibe", "genre", "mood", "suasana", "dengerin", "denger", "saran", "saranin", "buatin", "buatkan"]
                     
                     # Use raw_user_input for intent detection to avoid matching keywords in reply context
-                    # We use word boundaries to avoid false positives (e.g. 'speed' matching 'speedy')
+                    # We use a leading \b word boundary but no trailing boundary to support
+                    # Indonesian suffixes like -nya, -kan, -in (e.g. "playlistnya", "putarin")
                     import re
                     is_music_request = False
                     for kw in music_keywords:
-                        if re.search(rf'\b{re.escape(kw)}\b', raw_user_input.lower()):
+                        if re.search(rf'\b{re.escape(kw)}', raw_user_input.lower()):
                             is_music_request = True
                             break
                     music_tool = types.Tool(
@@ -515,6 +574,24 @@ class Chat(commands.Cog):
                                     },
                                     required=["filter_name"]
                                 )
+                            ),
+                            types.FunctionDeclaration(
+                                name="generate_playlist",
+                                description="Generate an AI-powered playlist based on a vibe, genre, or mood. Use this when the user wants multiple song recommendations or a playlist for a specific vibe/genre/mood.",
+                                parameters=types.Schema(
+                                    type="OBJECT",
+                                    properties={
+                                        "vibe": types.Schema(
+                                            type="STRING",
+                                            description="The vibe, genre, or mood for the playlist (e.g. lofi, rock, galau, semangat, jazz, chill, sad, workout)."
+                                        ),
+                                        "count": types.Schema(
+                                            type="INTEGER",
+                                            description="Number of songs to generate (1-25). Default 5 if not specified."
+                                        )
+                                    },
+                                    required=["vibe"]
+                                )
                             )
                         ]
                     )
@@ -589,7 +666,41 @@ class Chat(commands.Cog):
                         
                         for part in original_parts:
                             if part.text:
-                                await send_split_message(message, part.text)
+                                # Resolve :name: emojis in response text
+                                response_text = part.text
+                                if message.guild:
+                                    import re
+                                    def replace_emoji(match):
+                                        emoji_name = match.group(1)
+                                        # Search GLOBAL bot cache instead of just the current guild
+                                        found = discord.utils.get(self.bot.emojis, name=emoji_name)
+                                        if found:
+                                            return str(found)
+                                        return match.group(0) # Keep as is if not found
+                                    
+                                    response_text = re.sub(r':(\w+):', replace_emoji, response_text)
+
+                                # Resolve @Mentions in response text
+                                if message.guild:
+                                    def replace_mention(match):
+                                        identifier = match.group(1)
+                                        # get_member_named handles "Name#Discrim", "Name", or "ID"
+                                        # But for handles, we specifically want to search our member list
+                                        found = message.guild.get_member_named(identifier)
+                                        
+                                        if not found:
+                                            # Fallback: manual search in case get_member_named misses something
+                                            target = identifier.lower()
+                                            found = discord.utils.find(lambda m: m.name.lower() == target or m.display_name.lower() == target, message.guild.members)
+                                        
+                                        if found:
+                                            return found.mention
+                                        return match.group(0)
+                                    
+                                    # This regex matches @ followed by letters, numbers, dots, underscores, or hyphens
+                                    response_text = re.sub(r'@([\w\.\-]+)', replace_mention, response_text)
+                                
+                                await send_split_message(message, response_text)
                             
                             if part.function_call:
                                 function_called = True
@@ -601,7 +712,7 @@ class Chat(commands.Cog):
                                 
                                 try:
                                     # Check Voice State (Common check)
-                                    if func_name in ["play_music", "control_music", "set_volume", "manage_queue", "audio_filter"]:
+                                    if func_name in ["play_music", "control_music", "set_volume", "manage_queue", "audio_filter", "generate_playlist"]:
                                         if not message.author.voice:
                                             result_data = {"status": "error", "message": "User not in voice channel."}
                                         else:
@@ -677,6 +788,12 @@ class Chat(commands.Cog):
                                                         result_data = {"status": "success", "message": f"Applied filter: {filter_name}"}
                                                     else:
                                                         result_data = {"status": "error", "message": "Filters module missing."}
+
+                                                elif func_name == "generate_playlist":
+                                                    vibe = args["vibe"]
+                                                    count = int(args.get("count", 5))
+                                                    await music_cog.playlist(ctx, vibe=vibe, count=count)
+                                                    result_data = {"status": "success", "message": f"Generated AI playlist with vibe '{vibe}' ({count} songs)."}
 
                                 except Exception as e:
                                     print(f"Error executing tool {func_name}: {e}")

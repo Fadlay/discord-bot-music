@@ -43,3 +43,5 @@ list_models.py
 Thumbs.db
 
 temp_git/
+export_cookies.py
+cookie_helper.py
